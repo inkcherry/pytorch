@@ -161,6 +161,25 @@ Compared to PyTorch FSDP1 (`FullyShardedDataParallel`):
   details.
 
 
+### Custom Collective Backends
+
+FSDP2 issues its all-gather and reduce-scatter through pluggable backends. By
+default it uses `DefaultAllGather` / `DefaultReduceScatter`, but you can
+override them per module with `FSDPModule.set_custom_all_gather` and
+`FSDPModule.set_custom_reduce_scatter` to control how and where communication
+buffers are allocated and which collective is invoked. See `Comm` for the
+interface a backend implements.
+
+By default the all-gather output uses a rank-major (``[rank][param]``) layout
+and FSDP copies each parameter out into its own storage. A backend that can
+instead write a parameter-contiguous (``[param][rank]``) output may set
+`AllGather.supports_param_contiguous_output` and implement
+`AllGather.prepare_param_contiguous_output`. FSDP then views each unsharded
+parameter directly on top of the backend buffer, skipping the copy-out and its
+extra allocation. This fast path is used when every parameter has a single
+dtype-preserving all-gather input, is sharded on dim-0, and uses no all-gather
+extension or DTensor post-processing.
+
 ```{eval-rst}
 .. currentmodule:: torch.distributed.fsdp
 ```
