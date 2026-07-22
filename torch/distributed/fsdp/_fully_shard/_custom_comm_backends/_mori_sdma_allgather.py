@@ -2,19 +2,28 @@
 """MORI SDMA all-gather backend for FSDP2 on ROCm.
 
 This is an opt-in :class:`AllGather` backend backed by the ROCm `MORI
-<https://github.com/ROCm/mori>`_ SDMA collectives. Enable it on an FSDP module
-with::
+<https://github.com/ROCm/mori>`_ SDMA collectives. Install a **separate instance
+per FSDP module**, since each instance owns one all-gather output buffer::
 
-    from torch.distributed.fsdp._fully_shard._mori_sdma_allgather import (
+    from torch.distributed.fsdp._fully_shard._custom_comm_backends import (
         MoriSdmaAllGather,
     )
 
-    model.set_custom_all_gather(MoriSdmaAllGather(zero_copy_output=True))
+    for module in [*model.layers, model]:
+        fully_shard(module)
+        module.set_custom_all_gather(MoriSdmaAllGather(zero_copy_output=True))
+
+Sharing one instance across modules is not supported and raises: concurrently
+unsharded parameter groups would then all-gather into the same buffer and
+overwrite each other. ``set_custom_all_gather`` on a used instance also raises.
 
 When ``zero_copy_output`` is set the backend produces a parameter-contiguous
-output that FSDP can use in place, avoiding the rank-major copy-out. The
-``mori`` package is imported lazily so importing this module does not require
-ROCm/MORI to be installed.
+output that FSDP can use in place, avoiding the rank-major copy-out. FSDP then
+views the unsharded parameters into that buffer, so the buffer stays allocated
+while the module is sharded, trading memory for the removed copy-out.
+
+The ``mori`` package is imported lazily so importing this module does not
+require ROCm/MORI to be installed.
 """
 
 import importlib
@@ -24,12 +33,12 @@ from typing import Any, TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from ._fsdp_api import AllGather
+from .._fsdp_api import AllGather
 
 
 if TYPE_CHECKING:
-    from ._fsdp_collectives import AllGatherResult
-    from ._fsdp_param import FSDPParam
+    from .._fsdp_collectives import AllGatherResult
+    from .._fsdp_param import FSDPParam
 
 
 class _MoriSdmaAllGatherWork:
@@ -48,6 +57,9 @@ class _MoriSdmaAllGatherWork:
 class MoriSdmaAllGather(AllGather):
     """All-gather backend using MORI SDMA collectives (ROCm).
 
+    One instance owns one all-gather output buffer, so install a separate
+    instance per FSDP module (see the module docstring).
+
     Args:
         zero_copy_output (bool): produce a parameter-contiguous output that FSDP
             uses in place, skipping the rank-major copy-out wherever the
@@ -64,6 +76,8 @@ class MoriSdmaAllGather(AllGather):
         self._registered_output_ptr: int | None = None
         self._param_contiguous_split_sizes: torch.Tensor | None = None
         self._param_contiguous_split_offsets: torch.Tensor | None = None
+        # Identifies the one parameter group this instance serves
+        self._group_key: int | None = None
 
     def allocate(
         self,
@@ -141,6 +155,7 @@ class MoriSdmaAllGather(AllGather):
         param_all_gather_input_dtypes: list[list[torch.dtype]],
         param_all_gather_input_numels: list[list[int]],
     ) -> object | None:
+        self._check_single_param_group(fsdp_params)
         if not self._zero_copy_output:
             return None
 
@@ -235,6 +250,24 @@ class MoriSdmaAllGather(AllGather):
         self._param_contiguous_split_sizes = None
         self._param_contiguous_split_offsets = None
 
+    def _check_single_param_group(self, fsdp_params: list["FSDPParam"]) -> None:
+        """Reject reuse of this instance by a second parameter group.
+
+        The instance owns one output buffer, so two groups sharing it would
+        all-gather into the same memory while both are unsharded.
+        """
+        if not fsdp_params:
+            return
+        group_key = id(fsdp_params[0])
+        if self._group_key is None:
+            self._group_key = group_key
+        elif self._group_key != group_key:
+            raise RuntimeError(
+                "MoriSdmaAllGather is bound to a single FSDP parameter group but "
+                "was reused by another one. Install a separate "
+                "MoriSdmaAllGather instance per FSDP module."
+            )
+
     def _can_call_param_contiguous(self, input_tensor: torch.Tensor) -> bool:
         if (
             self._param_contiguous_split_sizes is None
@@ -307,6 +340,10 @@ class MoriSdmaAllGather(AllGather):
                 f"my_pe/npes={my_pe}/{npes}"
             )
 
+        # Transit buffer sizes in bytes. MORI grows them on demand, so start
+        # minimal instead of pre-allocating its 512 MB default: FSDP's own
+        # all-gather output is registered with MORI (see
+        # `_ensure_output_registered`) and used directly.
         self._collective = AllgatherSdma(
             my_pe,
             npes,

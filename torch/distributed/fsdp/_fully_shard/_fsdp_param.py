@@ -840,7 +840,17 @@ class FSDPParam:
         device: torch.device,
     ):
         if len(self.all_gather_outputs) > 0:
-            return  # already initialized
+            if not self._keep_all_gather_output_storage:
+                return  # already initialized
+            # This all-gather fell back to the default copy-out after a previous
+            # one used a backend-owned parameter-contiguous output (e.g. a
+            # post-forward reshard, which the eligibility gate excludes). The
+            # outputs are views into the backend buffer, so they must be
+            # replaced below rather than reused: `alloc_all_gather_outputs`
+            # would resize the whole backend buffer down to one view's size.
+            # Drop the unsharded parameter aliasing it too.
+            if hasattr(self, "_unsharded_param"):
+                del self._unsharded_param
         self._keep_all_gather_output_storage = False
         self.all_gather_outputs = [
             torch.empty(torch.Size([numel * world_size]), dtype=dtype, device=device)
