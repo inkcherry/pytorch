@@ -27,6 +27,7 @@ from torch.distributed.fsdp import (
     MixedPrecisionPolicy,
     OffloadPolicy,
 )
+from torch.distributed.fsdp._fully_shard._all_gather_layout import AllGatherLayout
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather
 from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
     _div_if_needed,
@@ -127,35 +128,10 @@ class _RankMajorTestAllGather(AllGather):
         )
 
 
-class _ParamContiguousTestAllGather(_RankMajorTestAllGather):
-    """Custom backend emulating a no-copy, parameter-contiguous output.
-
-    It reuses a single persistent output buffer and rearranges the rank-major
-    result into the ``[param][rank]`` layout that FSDP can view in place.
-    """
-
+class _ParamContiguousTestLayout(AllGatherLayout):
     def __init__(self) -> None:
-        super().__init__()
-        self.output: torch.Tensor | None = None
         self.split_sizes: list[int] = []
         self.world_size: int = -1
-
-    def allocate(
-        self,
-        size: Sequence[int | torch.SymInt],
-        *,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if (
-            self.output is None
-            or self.output.numel() != torch.Size(size).numel()
-            or self.output.dtype != dtype
-            or self.output.device != device
-        ):
-            self.output = torch.empty(size, dtype=dtype, device=device)
-            self.outputs.append(self.output)
-        return self.output
 
     def prepare_output(
         self,
@@ -168,6 +144,7 @@ class _ParamContiguousTestAllGather(_RankMajorTestAllGather):
         param_all_gather_input_dtypes: list[list[torch.dtype]],
         param_all_gather_input_numels: list[list[int]],
     ) -> object | None:
+        self.split_sizes = []
         if not self.can_use_param_contiguous_output(
             fsdp_params,
             param_all_gather_input_dtypes,
@@ -186,17 +163,8 @@ class _ParamContiguousTestAllGather(_RankMajorTestAllGather):
         all_gather_input_split_sizes: list[int],
         all_gather_input_numel: int,
         rank: int,
-        output_metadata: object | None,
+        output_metadata: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if output_metadata is None:
-            return super().copy_in(
-                all_gather_inputs,
-                all_gather_output,
-                all_gather_input_split_sizes,
-                all_gather_input_numel,
-                rank,
-                output_metadata,
-            )
         all_gather_input = torch.empty(
             (all_gather_input_numel,),
             dtype=all_gather_output.dtype,
@@ -213,17 +181,39 @@ class _ParamContiguousTestAllGather(_RankMajorTestAllGather):
         all_gather_result: AllGatherResult,
         fsdp_params: list[FSDPParam],
         group: dist.ProcessGroup,
-        default_finalize: Callable[[], None],
     ) -> None:
-        if all_gather_result.output_metadata is None:
-            default_finalize()
-            return
         self.init_param_contiguous_outputs(
             all_gather_result.all_gather_output,
             fsdp_params,
             all_gather_result.param_all_gather_input_numels,
             group.size(),
         )
+
+
+class _ParamContiguousTestAllGather(_RankMajorTestAllGather):
+    """Emulate parameter-contiguous output with a persistent buffer."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.output: torch.Tensor | None = None
+        self.layout = _ParamContiguousTestLayout()
+
+    def allocate(
+        self,
+        size: Sequence[int | torch.SymInt],
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if (
+            self.output is None
+            or self.output.numel() != torch.Size(size).numel()
+            or self.output.dtype != dtype
+            or self.output.device != device
+        ):
+            self.output = torch.empty(size, dtype=dtype, device=device)
+            self.outputs.append(self.output)
+        return self.output
 
     def __call__(
         self,
@@ -234,15 +224,19 @@ class _ParamContiguousTestAllGather(_RankMajorTestAllGather):
     ) -> dist.distributed_c10d.Work | None:
         if async_op:
             raise AssertionError("test all-gather only supports sync collectives")
+        if not self.layout.split_sizes:
+            return dist.all_gather_single(
+                output_tensor, input_tensor, group=group, async_op=False
+            )
         rank_major_output = torch.empty_like(output_tensor)
         dist.all_gather_single(
             rank_major_output, input_tensor, group=group, async_op=False
         )
-        rank_major_output = rank_major_output.view(self.world_size, -1)
+        rank_major_output = rank_major_output.view(self.layout.world_size, -1)
         input_offset = 0
         output_offset = 0
-        for split_size in self.split_sizes:
-            output_numel = split_size * self.world_size
+        for split_size in self.layout.split_sizes:
+            output_numel = split_size * self.layout.world_size
             output_tensor.narrow(0, output_offset, output_numel).copy_(
                 rank_major_output[:, input_offset : input_offset + split_size].reshape(
                     -1
@@ -253,40 +247,23 @@ class _ParamContiguousTestAllGather(_RankMajorTestAllGather):
         return None
 
 
-class _ZeroCopyThenFallbackAllGather(_ParamContiguousTestAllGather):
-    """Zero-copy on the first all-gather, then falls back to rank-major copy-out.
-
-    Emulates a group that becomes ineligible for the zero-copy output after a
-    successful zero-copy all-gather, so FSDP must not keep aliasing the stale
-    backend buffer.
-    """
-
+class _ZeroCopyThenFallbackLayout(_ParamContiguousTestLayout):
     def __init__(self) -> None:
         super().__init__()
-        self._use_param_contiguous = False
         self._first = True
 
     def prepare_output(self, *args: object, **kwargs: object) -> object | None:
         if self._first:
             self._first = False
-            metadata = super().prepare_output(*args, **kwargs)  # type: ignore[arg-type]
-            self._use_param_contiguous = metadata is not None
-            return metadata
-        self._use_param_contiguous = False
+            return super().prepare_output(*args, **kwargs)  # type: ignore[arg-type]
+        self.split_sizes = []
         return None
 
-    def __call__(
-        self,
-        output_tensor: torch.Tensor,
-        input_tensor: torch.Tensor,
-        group: dist.ProcessGroup,
-        async_op: bool = False,
-    ) -> dist.distributed_c10d.Work | None:
-        if self._use_param_contiguous:
-            return super().__call__(output_tensor, input_tensor, group, async_op)
-        return dist.all_gather_single(
-            output_tensor, input_tensor, group=group, async_op=False
-        )
+
+class _ZeroCopyThenFallbackAllGather(_ParamContiguousTestAllGather):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layout = _ZeroCopyThenFallbackLayout()
 
 
 class TestFullyShardCollectiveOps(FSDPTestMultiThread):
@@ -2425,7 +2402,7 @@ class TestParamContiguousEligibility(TestCase):
         )
 
     def _can_use(self, param) -> bool:
-        return DefaultAllGather().can_use_param_contiguous_output(
+        return _ParamContiguousTestLayout().can_use_param_contiguous_output(
             [param], [[torch.float32]], [[8]], torch.float32
         )
 
@@ -2447,7 +2424,7 @@ class TestParamContiguousEligibility(TestCase):
             )
         )
         self.assertFalse(
-            DefaultAllGather().can_use_param_contiguous_output(
+            _ParamContiguousTestLayout().can_use_param_contiguous_output(
                 [self._make_param()], [[torch.bfloat16]], [[8]], torch.float32
             )
         )

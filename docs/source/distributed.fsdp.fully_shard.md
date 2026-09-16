@@ -172,9 +172,10 @@ interface a backend implements.
 
 By default the all-gather output uses a rank-major (`[rank][param]`) layout and
 FSDP copies each parameter out into its own storage. A backend that can instead
-write a parameter-contiguous (`[param][rank]`) output may implement
-`AllGather.prepare_output` / `AllGather.copy_in` /
-`AllGather.finalize_outputs`. The backend can then choose an input layout that
+write a parameter-contiguous (`[param][rank]`) output may set `AllGather.layout`
+to an `AllGatherLayout` from
+`torch.distributed.fsdp._fully_shard._all_gather_layout`. Its `prepare_output`,
+`copy_in`, and `finalize_outputs` methods let the backend choose an input layout that
 matches its output layout and view each unsharded parameter directly on top of
 its output buffer, skipping the copy-out and its extra allocation. Because the
 unsharded parameters alias the backend output, this fast path follows a
@@ -184,9 +185,14 @@ is sharded on dim-0, and uses no all-gather extension or DTensor
 post-processing. It also
 falls back to the rank-major copy-out under `torch.compile` / compiled autograd
 (the aliasing is not traceable today) and during a post-forward mesh reshard.
-Backends can use the default `AllGather.can_use_param_contiguous_output` and
-`AllGather.init_param_contiguous_outputs` helpers to apply this policy and
-initialize the parameter views.
+Layouts can use `AllGatherLayout.can_use_param_contiguous_output` and
+`AllGatherLayout.init_param_contiguous_outputs` to apply this policy and
+initialize the parameter views. Without a layout, FSDP keeps the default
+copy-in and copy-out path. Returning `None` from `prepare_output` selects that
+path for the current collective, and the backend must produce rank-major output.
+Otherwise, FSDP carries the layout and its metadata with the result and calls
+`finalize_outputs` after waiting for the collective. Metadata and aliased buffers
+must remain valid until their consumers finish using them.
 
 ```{eval-rst}
 .. currentmodule:: torch.distributed.fsdp
