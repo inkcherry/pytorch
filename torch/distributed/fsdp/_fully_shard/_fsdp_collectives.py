@@ -354,41 +354,29 @@ def foreach_all_gather(
             all_gather_inputs = [*chain.from_iterable(param_all_gather_inputs)]
         inp_split_sizes = [t.numel() for t in all_gather_inputs]
         all_gather_input_numel = sum(inp_split_sizes)
-        layout = getattr(all_gather_comm, "layout", None)
+        layout = all_gather_comm.layout
+        copy_in = torch.ops.fsdp.all_gather_copy_in
         output_metadata = None
         if layout is not None:
-            output_metadata = layout.prepare_output(
-                inp_split_sizes,
-                all_gather_input_numel,
-                world_size,
-                dtype,
-                device,
+            copy_in, output_metadata = layout.prepare(
                 fsdp_params,
                 param_all_gather_input_dtypes,
                 param_all_gather_input_numels,
+                inp_split_sizes,
+                world_size,
+                dtype,
+                device,
             )
-            if output_metadata is None:
-                layout = None
         all_gather_output = all_gather_comm.allocate(
             (all_gather_input_numel * world_size,), dtype=dtype, device=device
         )
-        if layout is None:
-            all_gather_input, all_gather_output = torch.ops.fsdp.all_gather_copy_in(
-                all_gather_inputs,
-                all_gather_output,
-                inp_split_sizes,
-                all_gather_input_numel,
-                rank,
-            )
-        else:
-            all_gather_input, all_gather_output = layout.copy_in(
-                all_gather_inputs,
-                all_gather_output,
-                inp_split_sizes,
-                all_gather_input_numel,
-                rank,
-                output_metadata,
-            )
+        all_gather_input, all_gather_output = copy_in(
+            all_gather_inputs,
+            all_gather_output,
+            inp_split_sizes,
+            all_gather_input_numel,
+            rank,
+        )
         del param_all_gather_inputs
     all_gather_stream.wait_stream(all_gather_copy_in_stream)
     with device_handle.stream(all_gather_stream):
@@ -474,7 +462,7 @@ def foreach_all_gather_copy_out(
         param_all_gather_input_numels,
         all_gather_input_split_sizes,
         layout,
-        _output_metadata,
+        output_metadata,
     ) = all_gather_result
     _dtype, device = all_gather_output.dtype, all_gather_output.device
     device_handle = _get_device_handle(device.type)
@@ -482,7 +470,7 @@ def foreach_all_gather_copy_out(
         device_handle.current_stream().wait_event(all_gather_event)
     if isinstance(all_gather_work, dist.distributed_c10d.Work):  # async op
         all_gather_work.wait()
-    if layout is not None:
+    if layout is not None and output_metadata is not None:
         layout.finalize_outputs(all_gather_result, fsdp_params, group)
         return
     world_size, device = group.size(), all_gather_output.device

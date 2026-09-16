@@ -1,4 +1,6 @@
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -11,8 +13,39 @@ if TYPE_CHECKING:
     from ._fsdp_collectives import AllGatherResult
 
 
+AllGatherCopyIn = Callable[
+    [list[torch.Tensor], torch.Tensor, list[int], int, int],
+    tuple[torch.Tensor, torch.Tensor],
+]
+
+
 class AllGatherLayout(ABC):
     """Optional input packing and output layout for an all-gather backend."""
+
+    def prepare(
+        self,
+        fsdp_params: list[FSDPParam],
+        param_all_gather_input_dtypes: list[list[torch.dtype]],
+        param_all_gather_input_numels: list[list[int]],
+        split_sizes: list[int],
+        world_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[AllGatherCopyIn, object | None]:
+        """Select input packing and metadata before allocating the output."""
+        metadata = self.prepare_output(
+            split_sizes,
+            sum(split_sizes),
+            world_size,
+            dtype,
+            device,
+            fsdp_params,
+            param_all_gather_input_dtypes,
+            param_all_gather_input_numels,
+        )
+        if metadata is None:
+            return torch.ops.fsdp.all_gather_copy_in, None
+        return partial(self.copy_in, output_metadata=metadata), metadata
 
     @abstractmethod
     def prepare_output(
@@ -105,7 +138,13 @@ class AllGatherLayout(ABC):
         for fsdp_param, input_numels in zip(fsdp_params, param_all_gather_input_numels):
             output_numel = input_numels[0] * world_size
             param_output = all_gather_output.narrow(0, output_offset, output_numel)
-            fsdp_param.init_param_contiguous_all_gather_outputs(param_output)
+            if (
+                hasattr(fsdp_param, "_unsharded_param")
+                and fsdp_param._unsharded_param.data_ptr() != param_output.data_ptr()
+            ):
+                del fsdp_param._unsharded_param
+            fsdp_param.all_gather_outputs = [param_output]
+            fsdp_param._keep_all_gather_output_storage = True
             output_offset += output_numel
         if output_offset != all_gather_output.numel():
             raise AssertionError(

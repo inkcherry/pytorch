@@ -205,9 +205,7 @@ class FSDPParam:
         DTensorSpec | None
     )  # set for DTensor params (SPMD or TP/EP)
     all_gather_outputs: list[torch.Tensor]  # 1D
-    # Whether `all_gather_outputs` aliases a backend-owned, parameter-contiguous
-    # all-gather output that FSDP must not free/reallocate on reshard
-    _keep_all_gather_output_storage: bool
+    _keep_all_gather_output_storage: bool = False  # Backend-owned storage
     # All-gather extension attributes
     _extensions_data: ExtensionsData
     _unsharded_inner_tensors: list[torch.Tensor]
@@ -239,7 +237,6 @@ class FSDPParam:
             self._init_sharded_post_forward_param_metadata(param)
         self._init_extensions()
         self.all_gather_outputs: list[torch.Tensor] = []
-        self._keep_all_gather_output_storage = False
         self.unsharded_accumulated_grad = None
         self._param_fqn: str | None = None  # prefixed from root module
         # TODO: Remove this padding logic once DTensor pads the local tensor:
@@ -874,38 +871,17 @@ class FSDPParam:
         world_size: int,
         device: torch.device,
     ):
-        if len(self.all_gather_outputs) > 0:
-            if not self._keep_all_gather_output_storage:
-                return  # already initialized
-            # Falling back to the default copy-out after a zero-copy all-gather:
-            # drop the unsharded param aliasing the stale backend buffer.
+        if self._keep_all_gather_output_storage:
+            self.all_gather_outputs = []
+            self._keep_all_gather_output_storage = False
             if hasattr(self, "_unsharded_param"):
                 del self._unsharded_param
-        self._keep_all_gather_output_storage = False
+        if len(self.all_gather_outputs) > 0:
+            return  # already initialized
         self.all_gather_outputs = [
             torch.empty(torch.Size([numel * world_size]), dtype=dtype, device=device)
             for numel, dtype in zip(all_gather_input_numels, all_gather_input_dtypes)
         ]
-
-    def init_param_contiguous_all_gather_outputs(
-        self, all_gather_output: torch.Tensor
-    ) -> None:
-        """Alias this parameter's all-gather output to a backend-owned buffer.
-
-        Used by backends that produce a parameter-contiguous output: the buffer
-        is reused as the unsharded parameter storage, so FSDP must not free it
-        on reshard.
-        """
-        if (
-            hasattr(self, "_unsharded_param")
-            and self._unsharded_param.data_ptr() != all_gather_output.data_ptr()
-        ):
-            # The unsharded parameter from a previous all-gather no longer
-            # aliases the backend buffer; drop it so it is rebuilt over the new
-            # storage.
-            del self._unsharded_param
-        self.all_gather_outputs = [all_gather_output]
-        self._keep_all_gather_output_storage = True
 
     def init_unsharded_param(self):
         if hasattr(self, "_unsharded_param"):  # after the 1st all-gather
@@ -950,10 +926,6 @@ class FSDPParam:
             self._contiguous_orig_stride,
             storage_offset=unsharded_tensor.storage_offset(),
         )
-        if unsharded_param.data_ptr() != unsharded_tensor.data_ptr():
-            _raise_assert_with_print(
-                "FSDP unsharded parameter lost its all-gather output storage offset"
-            )
         if self.is_spmd_types:
             pass  # keep as plain tensor; spmd_types restored before module compute
         elif self._unsharded_dtensor_spec is not None:
@@ -1123,9 +1095,6 @@ class FSDPParam:
             alloc_storage(tensor)
 
     def free_all_gather_outputs(self) -> None:
-        # A parameter-contiguous all-gather output is owned by the backend, so
-        # its storage is left intact across reshards (see
-        # ``init_param_contiguous_all_gather_outputs``).
         if self._keep_all_gather_output_storage:
             return
         for tensor in self.all_gather_outputs:
