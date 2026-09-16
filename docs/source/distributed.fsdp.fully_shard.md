@@ -188,31 +188,6 @@ Backends can use the default `AllGather.can_use_param_contiguous_output` and
 `AllGather.init_param_contiguous_outputs` helpers to apply this policy and
 initialize the parameter views.
 
-A backend is selected explicitly per module with `set_custom_all_gather`. For
-example, the ROCm MORI SDMA backend (`MoriSdmaAllGather`) — which produces the
-parameter-contiguous output described above — is opted in as:
-
-```python
-from torch.distributed.fsdp import fully_shard
-from torch.distributed.fsdp._fully_shard._mori_sdma_allgather import (
-    MoriSdmaAllGather,
-)
-
-modules = [*model.layers, model]
-for module in modules:
-    fully_shard(module)
-
-# Route every FSDP all-gather through the MORI SDMA backend; the zero-copy
-# (parameter-contiguous) output is used wherever the group is eligible.
-all_gather = MoriSdmaAllGather(zero_copy_output=True)
-for module in modules:
-    module.set_custom_all_gather(all_gather)
-```
-
-`MoriSdmaAllGather` requires the optional ROCm MORI runtime/package and imports
-it lazily only when the backend is used.
-
-
 ```{eval-rst}
 .. currentmodule:: torch.distributed.fsdp
 ```

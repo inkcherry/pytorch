@@ -43,9 +43,6 @@ from torch.distributed.fsdp._fully_shard._fsdp_init import (
     _get_post_forward_mesh_info,
     _init_default_fully_shard_mesh,
 )
-from torch.distributed.fsdp._fully_shard._custom_comm_backends import (
-    MoriSdmaAllGather,
-)
 from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam, ShardedState
 from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
 from torch.distributed.tensor import DTensor
@@ -2376,47 +2373,6 @@ class TestFullyShardReduceOpWorldSize1(FSDPTest):
             all_reduce_op,
         ) = _get_gradient_divide_factors(group, None, torch.float32)
         self.assertEqual(all_reduce_op, ReduceOp.SUM)
-
-
-# =============================================================================
-# Runtime-free unit tests for the custom all-gather backend contract
-# =============================================================================
-
-
-class TestMoriSdmaAllGather(TestCase):
-    """Backend-level tests that do not require the ``mori`` runtime or GPUs."""
-
-    def test_missing_mori_dependency_error(self):
-        def import_module(name: str):
-            if name == "mori.shmem":
-                raise ModuleNotFoundError("No module named 'mori'", name="mori")
-            raise AssertionError(f"unexpected import: {name}")
-
-        comm = MoriSdmaAllGather()
-        group = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
-        with patch(
-            "torch.distributed.fsdp._fully_shard._custom_comm_backends"
-            "._mori_sdma_allgather.importlib.import_module",
-            side_effect=import_module,
-        ):
-            with self.assertRaisesRegex(
-                RuntimeError, "requires the optional ROCm MORI Python package"
-            ):
-                comm._get_collective(group)
-
-    def test_zero_copy_output_disabled(self):
-        comm = MoriSdmaAllGather(zero_copy_output=False)
-        metadata = comm.prepare_output(
-            [],
-            0,
-            1,
-            torch.float32,
-            torch.device("cpu"),
-            [],
-            [],
-            [],
-        )
-        self.assertIsNone(metadata)
 
 
 class TestParamContiguousEligibility(TestCase):
